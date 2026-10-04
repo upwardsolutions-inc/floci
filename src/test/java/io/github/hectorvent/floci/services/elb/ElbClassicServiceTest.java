@@ -16,6 +16,12 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -145,6 +151,58 @@ class ElbClassicServiceTest {
         create("my-elb");
         AwsException e = assertThrows(AwsException.class, () -> create("my-elb"));
         assertEquals("DuplicateLoadBalancerName", e.getErrorCode());
+    }
+
+    /**
+     * The name check and the write have to be one step. Checked before the write and nothing
+     * else, two creates of one name both pass the check and both commit, and the caller of the
+     * first is told it succeeded while holding a load balancer that was replaced.
+     */
+    @Test
+    void twoConcurrentCreatesOfOneNameLeaveOnlyOneWinner() throws Exception {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            String name = "concurrent-elb-" + attempt;
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            CountDownLatch start = new CountDownLatch(1);
+            try {
+                List<Future<?>> creates = List.of(
+                        pool.submit(() -> {
+                            start.await();
+                            // Zones rather than subnets, and no security group, so that nothing
+                            // in here reaches a mock from two threads at once.
+                            return service.createLoadBalancer(REGION, name,
+                                    List.of(httpListener()), List.of(REGION + "a"), List.of(),
+                                    List.of(), null, Map.of());
+                        }),
+                        pool.submit(() -> {
+                            start.await();
+                            return service.createLoadBalancer(REGION, name,
+                                    List.of(httpListener()), List.of(REGION + "a"), List.of(),
+                                    List.of(), null, Map.of());
+                        }));
+                start.countDown();
+                pool.shutdown();
+                assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "attempt did not finish");
+
+                int won = 0;
+                int refused = 0;
+                for (Future<?> create : creates) {
+                    try {
+                        create.get();
+                        won++;
+                    } catch (ExecutionException e) {
+                        assertTrue(e.getCause() instanceof AwsException aws
+                                        && "DuplicateLoadBalancerName".equals(aws.getErrorCode()),
+                                "the loser must be refused by name, got " + e.getCause());
+                        refused++;
+                    }
+                }
+                assertEquals(1, won, "exactly one create must succeed for attempt " + attempt);
+                assertEquals(1, refused, "exactly one create must be refused for attempt " + attempt);
+            } finally {
+                pool.shutdownNow();
+            }
+        }
     }
 
     @Test

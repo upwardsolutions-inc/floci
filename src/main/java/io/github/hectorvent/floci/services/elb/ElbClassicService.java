@@ -68,6 +68,9 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     // region → load balancer name → record
     private Map<String, Map<String, ClassicLoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
 
+    /** Stands in for IAM's certificate lock when this service is built without IAM. */
+    private final Object writeLock = new Object();
+
     public ElbClassicService(Ec2Service ec2Service,
                              ElbClassicHealthChecker healthChecker,
                              StorageFactory storageFactory,
@@ -165,9 +168,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         Map<String, ClassicLoadBalancer> regionLbs =
                 loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
         if (regionLbs.containsKey(name)) {
-            throw new AwsException("DuplicateLoadBalancerName",
-                    "Load balancer named " + name + " already exists and is not compatible with the "
-                            + "requested configuration.", 400);
+            throw duplicateLoadBalancerName(name);
         }
 
         String id = randomHex();
@@ -204,8 +205,18 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             lb.setAvailabilityZones(new ArrayList<>(availabilityZones));
         }
 
-        regionLbs.put(name, lb);
-        loadBalancers.put(region, regionLbs);
+        whileCertificatesHeld(() -> {
+            requireCertificates(region, listeners);
+            // Both checks again, and these are the ones that count. The pair above them fails
+            // fast and keeps AWS's error precedence, but a check made before the lock says
+            // nothing about the moment of the write: two creates of one name would both pass it
+            // and both commit, leaving only the second.
+            if (regionLbs.containsKey(name)) {
+                throw duplicateLoadBalancerName(name);
+            }
+            regionLbs.put(name, lb);
+            loadBalancers.put(region, regionLbs);
+        });
         healthChecker.startMonitoring(lb);
         return lb;
     }
@@ -282,31 +293,39 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             validateListener(listener);
         }
         requireCertificates(region, listeners);
-        for (ClassicListener listener : listeners) {
-            ClassicListener existing = lb.getListeners().stream()
-                    .filter(l -> l.getLoadBalancerPort().equals(listener.getLoadBalancerPort()))
-                    .findFirst()
-                    .orElse(null);
-            if (existing != null) {
-                // AWS accepts a repeat of an identical listener and rejects a conflicting one.
-                if (!sameListener(existing, listener)) {
-                    throw new AwsException("DuplicateListener",
-                            "A listener already exists for " + name + " with LoadBalancerPort "
-                                    + listener.getLoadBalancerPort()
-                                    + ", but with a different InstancePort, Protocol, or "
-                                    + "SSLCertificateId", 400);
+        whileCertificatesHeld(() -> {
+            requireCertificates(region, listeners);
+            for (ClassicListener listener : listeners) {
+                ClassicListener existing = lb.getListeners().stream()
+                        .filter(l -> l.getLoadBalancerPort().equals(listener.getLoadBalancerPort()))
+                        .findFirst()
+                        .orElse(null);
+                if (existing != null) {
+                    // AWS accepts a repeat of an identical listener and rejects a conflicting one.
+                    if (!sameListener(existing, listener)) {
+                        throw new AwsException("DuplicateListener",
+                                "A listener already exists for " + name + " with LoadBalancerPort "
+                                        + listener.getLoadBalancerPort()
+                                        + ", but with a different InstancePort, Protocol, or "
+                                        + "SSLCertificateId", 400);
+                    }
+                    continue;
                 }
-                continue;
+                lb.getListeners().add(listener);
             }
-            lb.getListeners().add(listener);
-        }
-        persist(region);
+            persist(region);
+        });
     }
 
     public void deleteLoadBalancerListeners(String region, String name, List<Integer> loadBalancerPorts) {
         ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        lb.getListeners().removeIf(l -> loadBalancerPorts.contains(l.getLoadBalancerPort()));
-        persist(region);
+        // Under the same lock as the add, for a different reason: the certificate delete walks
+        // this list while holding that lock, and removing from it is a structural change to the
+        // list being walked, which ends the walk in ConcurrentModificationException.
+        whileCertificatesHeld(() -> {
+            lb.getListeners().removeIf(l -> loadBalancerPorts.contains(l.getLoadBalancerPort()));
+            persist(region);
+        });
     }
 
     // ── Health ────────────────────────────────────────────────────────────────
@@ -573,6 +592,35 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             }
         }
         return references;
+    }
+
+    private static AwsException duplicateLoadBalancerName(String name) {
+        return new AwsException("DuplicateLoadBalancerName",
+                "Load balancer named " + name + " already exists and is not compatible with the "
+                        + "requested configuration.", 400);
+    }
+
+    /**
+     * Runs a write that records a listener's certificate while IAM holds the lock
+     * {@code DeleteServerCertificate} takes, so a certificate cannot be deleted between the check
+     * and the write. The callers re-check inside the guard: the fail-fast check above it keeps the
+     * error precedence AWS has, and only the one under the guard is atomic with the commit.
+     *
+     * <p>Taken unconditionally, rather than only for a write that names a certificate, because
+     * the certificate delete walks the live listener list of every load balancer and any
+     * structural change to it ends that walk. It also carries this class's own invariants, the
+     * load balancer name being unique among them, so it stands in for the monitor these methods
+     * do not otherwise have. Without IAM, which is how the unit tests build this service, it
+     * falls back to a monitor of its own so those invariants still hold.
+     */
+    private void whileCertificatesHeld(Runnable action) {
+        if (iamService == null) {
+            synchronized (writeLock) {
+                action.run();
+            }
+        } else {
+            iamService.runWithServerCertificatesHeld(action);
+        }
     }
 
     private void requireCertificates(String region, List<ClassicListener> listeners) {
